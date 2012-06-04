@@ -1,0 +1,112 @@
+#!/bin/bash
+#
+# This is an example script that install and configure grub after installation.
+# To use it put it in your CUSTOMIZE_DIR, make it executable, and edit EXTRAPKGS
+# of your $sysconfdir/default/ganeti-instance-debootstrap.
+#
+# Xen, for etch/lenny i386:
+#   EXTRA_PKGS="linux-image-xen-686,libc6-xen"
+# Xen, for etch/lenny amd64:
+#   EXTRA_PKGS="linux-image-xen-amd64"
+# KVM:
+#   no extra packages needed besides the normal suggested ones
+#
+# Do not include grub in EXTRA_PKGS because it will cause error of debootstrap.
+
+set -e
+
+. common.sh
+
+CLEANUP=( )
+
+trap cleanup EXIT
+
+if [ -z "$TARGET" -o ! -d "$TARGET" ]; then
+  echo "Missing target directory"
+  exit 1
+fi
+
+# Set disk based on type of hypervisor
+disk=""
+if [ "${HYPERVISOR}" = "kvm" ] ; then
+  disk="vda"
+else
+  disk="xda"
+fi
+
+# install grub
+LANG=C
+export DEBIAN_FRONTEND=noninteractive
+chroot "$TARGET" apt-get -y --force-yes install grub-legacy
+
+# make /dev/${disk}
+mknod $TARGET/dev/${disk} b $(stat -L -c "0x%t 0x%T" $BLOCKDEV)
+CLEANUP+=("rm -f $TARGET/dev/${disk}")
+
+# make /dev/${disk}1
+mknod $TARGET/dev/${disk}1 b $(stat -L -c "0x%t 0x%T" $FSYSDEV)
+CLEANUP+=("rm -f $TARGET/dev/${disk}1")
+
+# setup minimal proc environment for grub2
+mkdir -p ${TARGET}/proc/
+cat > ${TARGET}/proc/mounts <<EOF
+/dev/${disk}${root_part} / ${FILESYSTEM} rw,relatime,barrier=1,data=ordered 0 0
+EOF
+CLEANUP+=("rm -r ${TARGET}/proc/mounts")
+
+cat > ${TARGET}/proc/devices <<EOF
+Block devices:
+253 virtblk
+252 device-mapper
+EOF
+CLEANUP+=("rm -r ${TARGET}/proc/devices")
+
+cat > ${TARGET}/proc/misc << EOF
+ 60 device-mapper
+EOF
+CLEANUP+=("rm -r ${TARGET}/proc/misc")
+
+cat > "${TARGET}/proc/swaps" <<EOF
+Filename				Type		Size	Used	Priority
+EOF
+CLEANUP+=("rm -r ${TARGET}/proc/swaps")
+
+# create grub directory
+mkdir -p "$TARGET/boot/grub"
+
+# create device.map
+cat > "$TARGET/boot/grub/device.map" <<EOF
+(hd0) /dev/${disk}
+EOF
+
+# create menu.lst
+cat > "$TARGET/boot/grub/menu.lst" <<EOF
+default 0
+timeout 5
+root (hd0,0)
+
+title Debian Linux
+kernel /vmlinuz root=/dev/${disk}1 ro
+initrd /initrd.img
+EOF
+
+# Copying files from /lib/grub, /usr/lib/grub and /usr/share/grub
+for x in \
+    "${TARGET}"/lib*/grub/*/* \
+    "${TARGET}"/usr/lib*/grub/*/* \
+    "${TARGET}"/usr/share/grub/* ; do
+    [[ -f ${x} ]] && cp -p "${x}" "${TARGET}"/boot/grub/
+done
+
+# install grub to the block device
+chroot ${TARGET} grub --batch --no-floppy --device-map=/boot/grub/device.map <<EOF
+root (hd0,0)
+setup (hd0)
+quit
+EOF
+
+# execute cleanups
+cleanup
+trap - EXIT
+
+exit 0
